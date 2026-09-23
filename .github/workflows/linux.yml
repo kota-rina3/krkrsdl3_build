@@ -1,0 +1,325 @@
+###############################################################################
+# krkrsdl3 —— Linux 构建流水线
+#
+# 三个架构都在 Deepin 容器里构建，产物天然的 glibc / 系统库依赖就和 Deepin 25 对齐：
+#
+#   x64       ubuntu-24.04       linuxdeepin/deepin:crimson-amd64-v1.6.0
+#   arm64     ubuntu-24.04-arm   linuxdeepin/deepin:crimson-arm64-v1.6.0
+#   loong64   ubuntu-24.04 + QEMU linuxdeepin/deepin:crimson-loong64-v1.6.0
+#
+# 为什么不用 GitHub 的 container: 语法：
+#   容器作业里 JS action 跑的是 runner 注入的 node，那是宿主机架构的二进制。
+#   龙芯容器靠 QEMU 模拟，x86_64 的 node 在里面直接跑不起来，checkout / cache /
+#   upload-artifact 全废。所以这里统一改成「宿主做编排、docker run 做构建」，
+#   三个架构走同一条代码路径，也顺手绕开了镜像里可能没有 git/node 的问题。
+#
+# 触发方式：
+#   push 到 main（按 paths 过滤）  → 三架构全量构建，产物进 Actions artifact
+#   pull_request                   → 同上，用来卡 PR
+#   发布 Release                   → 三架构构建并把 tar.gz 挂到 Release 上
+#   workflow_dispatch              → 手动指定单架构 / 目标 / strip
+#
+# 注意：push tag 时 paths 过滤仍然生效（tag 指向的提交若没动过这些路径就不会触发）。
+#       要发版请走「发布 Release」，那个事件不受 paths 限制。
+###############################################################################
+name: Linux Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'cmake/**'
+      - 'vcpkg.json'
+      - 'vcpkg-configuration.json'
+      - 'vcpkg/**'
+      - 'Res/**'
+      - 'script/**'
+      - 'ci/**'
+      - 'cpp'
+      - '.github/workflows/linux.yml'
+  pull_request:
+    paths:
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'cmake/**'
+      - 'vcpkg.json'
+      - 'vcpkg-configuration.json'
+      - 'vcpkg/**'
+      - 'Res/**'
+      - 'script/**'
+      - 'ci/**'
+      - 'cpp'
+      - '.github/workflows/linux.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      only_arch:
+        description: '只构建指定架构'
+        type: choice
+        options: [all, x64, arm64, loong64]
+        default: all
+      target:
+        description: '构建目标'
+        type: choice
+        options: [full, console]
+        default: full
+      strip:
+        description: '对产物执行 strip（会去掉符号，调试用的话别开）'
+        type: boolean
+        default: false
+
+# 同一分支上新的 push 顶掉旧的，PR 上则取消正在跑的旧构建
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # 只影响容器内「回滚到镜像自带源」的日志友好度，不参与功能
+  DEBIAN_FRONTEND: noninteractive
+  TZ: Asia/Shanghai
+  # 可选：仓库变量里配一个 Deepin 软件源镜像（Deepin 官方源在国外跑得慢）
+  KRKRSDL3_APT_MIRROR: ${{ vars.DEEPIN_APT_MIRROR }}
+
+jobs:
+  build:
+    name: Linux / ${{ matrix.arch }}
+    # 手动触发时按 only_arch 过滤；push / PR / Release 事件全量构建
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.only_arch == 'all' ||
+      inputs.only_arch == matrix.arch
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            image: linuxdeepin/deepin:crimson-amd64-v1.6.0
+            triplet: x64-linux-release
+            jobs: 4
+            timeout: 180
+          # arm64 用的是 GitHub 的 Arm 原生 runner：公开仓库免费，
+          # 私有仓库要换成自建 runner 或者 ubuntu-24.04 + QEMU(arm64)
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            image: linuxdeepin/deepin:crimson-arm64-v1.6.0
+            triplet: arm64-linux-release
+            jobs: 4
+            timeout: 180
+          # 龙芯没有原生机型，只能 QEMU 模拟，慢一个数量级：
+          # 首次冷启动要把 vcpkg 那堆依赖全编一遍，很可能撞 6 小时上限。
+          # 建议日常别手动跑，靠 workflow_dispatch 单独跑 + 二进制缓存续命。
+          - arch: loong64
+            runner: ubuntu-24.04
+            platform: linux/loong64
+            image: linuxdeepin/deepin:crimson-loong64-v1.6.0
+            triplet: loongarch64-linux-release
+            jobs: 4
+            timeout: 350
+            qemu: true
+
+    env:
+      KRKRSDL3_TARGET: ${{ inputs.target || 'full' }}
+      KRKRSDL3_STRIP: ${{ inputs.strip && '1' || '0' }}
+      KRKRSDL3_JOBS: ${{ matrix.jobs }}
+      KRKRSDL3_CACHE_DIR: ${{ github.workspace }}/.ci-cache
+      VCPKG_BASELINE: 8e8dfb4ba483886936ded5ca201b500b8d8b0096
+      # 子模块拉取失败时的兜底克隆源（fork 了源码仓库就改这里）
+      KRKRSDL3_SOURCE_REPO: https://github.com/krkrsdl3/krkrsdl3.git
+
+    steps:
+      - name: 拉取代码（含 cpp 子模块）
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # 注意 platforms 的值是原样透传给 `binfmt --install` 的，
+      # binfmt 认的架构名是 loong64（不是 loongarch64），写错会报 unknown architecture
+      - name: 注册 QEMU 模拟器
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: loong64
+
+      - name: 环境信息
+        run: |
+          {
+            echo "### 运行环境 / ${{ matrix.arch }}"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| runner | \`${{ matrix.runner }}\` |"
+            echo "| 容器镜像 | \`${{ matrix.image }}\` |"
+            echo "| 平台 | \`${{ matrix.platform }}\` |"
+            echo "| vcpkg triplet | \`${{ matrix.triplet }}\` |"
+            echo "| 目标 | \`${{ env.KRKRSDL3_TARGET }}\` |"
+            echo "| 模拟 | ${{ matrix.qemu && 'QEMU（慢）' || '原生' }} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "runner: $(uname -m)  nproc: $(nproc)  disk: $(df -h / | tail -1)"
+
+      # ---------------- 缓存 ----------------
+      # 分三份，各自独立失效：
+      #   vcpkg-tool  —— baseline 变了就重新拉+引导
+      #   vcpkg-deps  —— 依赖清单/自定义 port 变了就重算二进制缓存
+      #   ccache      —— 每次提交新 key，靠 restore-keys 累积命中
+      # 一律用 restore + save 拆开，配合 if: always()，
+      # 这样 QEMU 上跑到一半超时/失败，已经编好的包也能存下来，下次接着跑。
+      - name: 恢复 vcpkg 工具链缓存
+        id: cache-vcpkg-tool
+        uses: actions/cache/restore@v6
+        with:
+          path: .ci-cache/vcpkg
+          key: vcpkg-tool-${{ matrix.arch }}-${{ env.VCPKG_BASELINE }}
+          restore-keys: |
+            vcpkg-tool-${{ matrix.arch }}-
+
+      - name: 恢复 vcpkg 依赖缓存
+        id: cache-vcpkg-deps
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            .ci-cache/vcpkg-downloads
+            .ci-cache/vcpkg-binary
+          key: vcpkg-deps-${{ matrix.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg/ports/**', 'vcpkg/triplets/**') }}
+          restore-keys: |
+            vcpkg-deps-${{ matrix.arch }}-
+
+      - name: 恢复 ccache
+        id: cache-ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: .ci-cache/ccache
+          key: ccache-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.arch }}-
+
+      # ---------------- 构建 ----------------
+      - name: 拉取容器镜像
+        env:
+          IMAGE: ${{ matrix.image }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          time docker pull --platform "$PLATFORM" "$IMAGE"
+          docker image inspect "$IMAGE" --format '镜像大小: {{.Size}} 架构: {{.Architecture}}'
+
+      - name: 在 Deepin 容器内构建
+        env:
+          IMAGE: ${{ matrix.image }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+          TRIPLET: ${{ matrix.triplet }}
+        run: |
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --user 0:0 \
+            --name "krkrsdl3-ci-$ARCH" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -w "$GITHUB_WORKSPACE" \
+            --entrypoint /bin/bash \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -e TZ=Asia/Shanghai \
+            -e GITHUB_STEP_SUMMARY="$GITHUB_WORKSPACE/.ci-cache/step-summary.md" \
+            -e KRKRSDL3_WORKSPACE="$GITHUB_WORKSPACE" \
+            -e KRKRSDL3_CACHE_DIR="$KRKRSDL3_CACHE_DIR" \
+            -e KRKRSDL3_ARCH="$ARCH" \
+            -e KRKRSDL3_TRIPLET="$TRIPLET" \
+            -e KRKRSDL3_TARGET="$KRKRSDL3_TARGET" \
+            -e KRKRSDL3_JOBS="$KRKRSDL3_JOBS" \
+            -e KRKRSDL3_STRIP="$KRKRSDL3_STRIP" \
+            -e KRKRSDL3_APT_MIRROR="$KRKRSDL3_APT_MIRROR" \
+            -e KRKRSDL3_SOURCE_REPO="$KRKRSDL3_SOURCE_REPO" \
+            "$IMAGE" \
+            "$GITHUB_WORKSPACE/ci/linux/container-build.sh"
+          # 容器里是 root，把产物/缓存目录交还给 runner 用户
+          # （actions/cache/save 与 upload-artifact 都是以 runner 身份跑的）
+          sudo chown -R "$(id -u):$(id -g)" dist .ci-cache 2>/dev/null || true
+          # 容器内的 /tmp 和宿主机不共享，汇总文件写在挂载进来的工作区里
+          cat "$GITHUB_WORKSPACE/.ci-cache/step-summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: 产物清单
+        run: |
+          ls -lh dist/ || true
+          for f in dist/*.tar.gz; do
+            [ -e "$f" ] || continue
+            echo "---- $f ----"
+            tar -tzf "$f" | head -20
+            cat "${f}.sha256"
+          done
+
+      # ---------------- 保存缓存 ----------------
+      - name: 保存 vcpkg 工具链缓存
+        if: always() && steps.cache-vcpkg-tool.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .ci-cache/vcpkg
+          key: vcpkg-tool-${{ matrix.arch }}-${{ env.VCPKG_BASELINE }}
+
+      - name: 保存 vcpkg 依赖缓存
+        if: always() && steps.cache-vcpkg-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            .ci-cache/vcpkg-downloads
+            .ci-cache/vcpkg-binary
+          key: vcpkg-deps-${{ matrix.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg/ports/**', 'vcpkg/triplets/**') }}
+
+      - name: 保存 ccache
+        if: always() && steps.cache-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .ci-cache/ccache
+          key: ccache-${{ matrix.arch }}-${{ github.sha }}
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: krkrsdl3-linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # 发布 Release 时把三个架构的包挂上去（raw tag push 也覆盖）
+  publish:
+    name: 上传到 Release
+    needs: build
+    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: 收集产物
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 上传
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 这个 job 没有 checkout，gh 需要显式知道仓库是谁
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
+          echo "已上传到 Release $TAG" >> "$GITHUB_STEP_SUMMARY"
